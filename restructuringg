@@ -1,0 +1,322 @@
+import json
+import os
+import re
+import logging
+from typing import List, Dict, Any, Optional, Callable
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeResult, DocumentParagraph, DocumentTable
+from azure.core.credentials import AzureKeyCredential
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+class Config:
+    DOCUMENT_INTELLIGENCE_ENDPOINT = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT")
+    DOCUMENT_INTELLIGENCE_KEY = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
+
+    @classmethod
+    def get_required_config(cls, var_name: str) -> str:
+        value = getattr(cls, var_name)
+        if value is None:
+            raise EnvironmentError(f"Missing required environment variable for {var_name}.")
+        return value
+
+# --- Document Intelligence Client ---
+def get_doc_intelligence_client() -> Optional[DocumentIntelligenceClient]:
+    try:
+        endpoint = Config.get_required_config("DOCUMENT_INTELLIGENCE_ENDPOINT")
+        key = Config.get_required_config("DOCUMENT_INTELLIGENCE_KEY")
+        return DocumentIntelligenceClient(
+            endpoint=endpoint,
+            credential=AzureKeyCredential(key)
+        )
+    except EnvironmentError as e:
+        logger.error(f"Missing config for DocumentIntelligence client: {e}")
+    except Exception as e:
+        logger.error(f"Failed to initialize DocumentIntelligence client: {e}", exc_info=True)
+    return None
+
+# --- Helper Functions ---
+def clean_text(text: str) -> str:
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = text.replace('  ', ' ')
+    return text.strip()
+
+def extract_list_items(text_block: str) -> List[str]:
+    items = []
+    list_item_pattern = re.compile(r'^\s*(?P<marker>(?:\d+\.|\-|\*))\s*(?P<content>.*?)(?=\n\s*(?:\d+\.|\-|\*)|(?:\n{2,})|\Z)', re.DOTALL | re.MULTILINE)
+    matches = list_item_pattern.finditer(text_block + "\n\n\n")
+    for match in matches:
+        item_content = match.group('content')
+        items.append(clean_text(item_content))
+    return [item for item in items if item]
+
+def extract_key_value_pairs_from_text(text_block: str) -> List[Dict[str, str]]:
+    pairs = []
+    key_value_pattern = re.compile(r'^\s*(?P<key>[A-Za-z\s\-\.\']{2,}?)\s*[:\-]\s*(?P<value>.*?)(?=\n\s*[A-Za-z\s\-\.\']{2,}?\s*[:\-]|(?:\n{2,})|\Z)', re.DOTALL | re.MULTILINE)
+    matches = key_value_pattern.finditer(text_block + "\n\n")
+    for match in matches:
+        pairs.append({"term": clean_text(match.group('key')), "definition": clean_text(match.group('value'))})
+    return pairs
+
+def extract_questions_from_text(text_block: str) -> List[str]:
+    questions = []
+    q_pattern = re.compile(r'^(Q\d+\.\s*.+?)(?=\nQ\d+\.|\n\d+\.|\Z)', re.DOTALL | re.MULTILINE)
+    q_matches = q_pattern.findall(text_block + "\nQ")
+    if q_matches:
+        for match in q_matches:
+            questions.append(clean_text(match))
+        return [q for q in questions if q]
+    list_questions_pattern = re.compile(r'^\s*(\d+\.\s*.+?)(?=\n\s*\d+\.|\n\n|\Z)', re.DOTALL | re.MULTILINE)
+    list_q_matches = list_questions_pattern.finditer(text_block + "\n\n")
+    if list(list_q_matches):
+        list_questions = extract_list_items(text_block)
+        return [q for q in list_questions if q]
+    return []
+
+def extract_table_data(table: DocumentTable) -> List[List[str]]:
+    table_data = []
+    if not table.cells:
+        return table_data
+    max_row = max(c.row_index for c in table.cells) if table.cells else -1
+    max_col = max(c.column_index for c in table.cells) if table.cells else -1
+    if max_row < 0 or max_col < 0:
+        return table_data
+    grid = [['' for _ in range(max_col + 1)] for _ in range(max_row + 1)]
+    for cell in table.cells:
+        if cell.row_index <= max_row and cell.column_index <= max_col:
+            grid[cell.row_index][cell.column_index] = clean_text(cell.content)
+    for row in grid:
+        table_data.append(row)
+    return table_data
+
+# --- New Modular Extraction Functions ---
+
+def extract_metadata(text_block: str) -> Dict[str, Any]:
+    metadata = {}
+    title_match = re.search(r"^(Lesson \d+ - .+)", text_block, re.MULTILINE)
+    if title_match:
+        metadata["title"] = clean_text(title_match.group(1))
+    return metadata
+
+def extract_weekly_topics(text_block: str) -> Dict[str, Any]:
+    content = {"topics": extract_list_items(text_block)}
+    return content
+
+def extract_learning_objectives(text_block: str) -> Dict[str, Any]:
+    content = {}
+    learning_objective_match = re.search(r"(?i)Learning Objective:\s*(.+?)(?=Lesson Outcomes:|\Z)", text_block, re.DOTALL)
+    if learning_objective_match:
+        content["objective"] = clean_text(learning_objective_match.group(1))
+    outcomes_match = re.search(r"(?i)Lesson Outcomes:\s*Discover:\s*(.+?)Develop:\s*(.+?)Master:\s*(.+)", text_block, re.DOTALL)
+    if outcomes_match:
+        content["outcomes"] = {
+            "discover": clean_text(outcomes_match.group(1)),
+            "develop": clean_text(outcomes_match.group(2)),
+            "master": clean_text(outcomes_match.group(3))
+        }
+    return content
+
+def extract_hpl_links(text_block: str) -> Dict[str, Any]:
+    content = {}
+    cultural_link_match = re.search(r"(?i)Cultural Identity Link:\s*(.+?)(?=Meaningful connections:|\Z)", text_block, re.DOTALL)
+    if cultural_link_match:
+        content["cultural_link"] = clean_text(cultural_link_match.group(1))
+    meaningful_connections_match = re.search(r"(?i)Meaningful connections:\s*(.+)", text_block, re.DOTALL)
+    if meaningful_connections_match:
+        content["meaningful_connections"] = clean_text(meaningful_connections_match.group(1))
+    return content
+
+def extract_success_criteria(text_block: str, tables: List[DocumentTable]) -> Dict[str, Any]:
+    criteria = []
+    if tables:
+        for table in tables:
+            table_data = extract_table_data(table)
+            for row in table_data:
+                if len(row) > 1 and row[0].isdigit():
+                    try:
+                        criteria.append({"id": int(row[0]), "description": clean_text(row[1])})
+                    except ValueError:
+                        pass
+    if not criteria:
+        criteria_list = extract_list_items(text_block)
+        criteria = [{"id": i + 1, "description": item} for i, item in enumerate(criteria_list)]
+    return {"criteria": criteria}
+
+def extract_key_vocabulary(text_block: str, tables: List[DocumentTable]) -> Dict[str, Any]:
+    vocab = []
+    if tables:
+        for table in tables:
+            table_data = extract_table_data(table)
+            for row in table_data:
+                if len(row) >= 2 and row[0] and row[1]:
+                    vocab.append({"term": clean_text(row[0]), "definition": clean_text(row[1])})
+    if not vocab:
+        vocab = extract_key_value_pairs_from_text(text_block)
+    return {"vocabulary": vocab}
+
+def extract_questions_and_answers(text_block: str) -> Dict[str, Any]:
+    content = {}
+    questions = extract_questions_from_text(text_block)
+    if questions:
+        content["questions"] = questions
+    challenge_match = re.search(r"(?i)Challenge:\s*(.+?)(?:\nAnswer:|\Z)", text_block, re.DOTALL)
+    if challenge_match:
+        challenge_prompt = clean_text(challenge_match.group(1))
+        content["challenge"] = {"prompt": challenge_prompt}
+    answers = extract_list_items(text_block)
+    if answers:
+        content["answers"] = answers
+    return content
+
+def extract_general_text(text_block: str) -> Dict[str, Any]:
+    return {"full_text": clean_text(text_block)}
+
+# --- Mapping from Title to Extractor Function and Section Type ---
+EXTRACTION_MAP = {
+    r"^(Lesson \d+ - .+?)": ("lesson_overview", extract_metadata),
+    r"^(THE BIGGER PICTURE)": ("weekly_summary", extract_weekly_topics),
+    r"^(LEARNING OBJECTIVES(?: & OUTCOMES)?)": ("learning_objectives", extract_learning_objectives),
+    r"^(HPL ACPS & VAAS|HPL link, cultural identity link)": ("hpl_connections", extract_hpl_links),
+    r"^(SUCCESS CRITERIA)": ("success_criteria", extract_success_criteria),
+    r"^(KEY VOCABULARY)": ("key_vocabulary", extract_key_vocabulary),
+    r"^(GL PRACTICE|FLASHBACK|AFL\.1|AFL\.2)": ("practice_questions", extract_questions_and_answers),
+    r"^(TEACHER INPUT|MAIN ACTIVITY|STRETCH/ CHALLENGE|REFLECTION|Visual Keys)": ("general_section", extract_general_text)
+}
+
+# --- Main Restructuring Function ---
+def restructure_document_to_desired_format(
+    document_intelligence_result: AnalyzeResult,
+    file_name: str
+) -> Dict[str, Any]:
+    paragraphs_by_page: Dict[int, List[DocumentParagraph]] = {}
+    if document_intelligence_result.paragraphs:
+        for para in document_intelligence_result.paragraphs:
+            if para.bounding_regions and len(para.bounding_regions) > 0:
+                page_num = para.bounding_regions[0].page_number
+                paragraphs_by_page.setdefault(page_num, []).append(para)
+
+    tables_by_page: Dict[int, List[DocumentTable]] = {}
+    if document_intelligence_result.tables:
+        for table in document_intelligence_result.tables:
+            if table.bounding_regions and len(table.bounding_regions) > 0:
+                page_num = table.bounding_regions[0].page_number
+                tables_by_page.setdefault(page_num, []).append(table)
+
+    restructured_doc = {
+        "document_id": file_name.replace('.', '_').replace(' ', '_'),
+        "metadata": {"source_pdf_filename": file_name},
+        "content_sections": []
+    }
+
+    for page_num in sorted(paragraphs_by_page.keys()):
+        current_page_paragraphs = paragraphs_by_page.get(page_num, [])
+        current_page_paragraphs.sort(key=lambda p: p.bounding_regions[0].polygon[1] if p.bounding_regions else 0)
+        slide_full_text = "\n\n".join([clean_text(para.content) for para in current_page_paragraphs])
+        
+        extracted_content = {}
+        section_type = "unknown"
+        section_title = f"Slide {page_num}"
+        text_for_extraction = slide_full_text
+        
+        if current_page_paragraphs:
+            first_paragraph_content = clean_text(current_page_paragraphs[0].content)
+            
+            # --- New, robust title matching logic ---
+            matched_pattern = None
+            for pattern in EXTRACTION_MAP.keys():
+                title_match = re.search(pattern, first_paragraph_content, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    matched_pattern = pattern
+                    break
+            
+            if matched_pattern:
+                s_type, extractor = EXTRACTION_MAP[matched_pattern]
+                title_match_full_text = re.search(matched_pattern, slide_full_text, re.IGNORECASE | re.DOTALL)
+                
+                if title_match_full_text:
+                    section_title = clean_text(title_match_full_text.group(0))
+                    section_type = s_type
+                    
+                    # Remove the identified title from the text for extraction
+                    text_for_extraction = re.sub(re.escape(section_title), '', slide_full_text, 1, re.IGNORECASE | re.DOTALL).strip()
+                    
+                    current_page_tables = tables_by_page.get(page_num, [])
+                    if s_type in ["success_criteria", "key_vocabulary"]:
+                        extracted_content = extractor(text_for_extraction, current_page_tables)
+                    else:
+                        extracted_content = extractor(text_for_extraction)
+            else:
+                # Handle cases where no specific pattern matched
+                # Remove generic "Slide [number]" title from the content if present
+                generic_title_pattern = re.compile(r'^Slide \d+', re.IGNORECASE)
+                if generic_title_pattern.match(first_paragraph_content):
+                    section_title = generic_title_pattern.match(first_paragraph_content).group(0)
+                    text_for_extraction = re.sub(generic_title_pattern, '', slide_full_text, 1, re.IGNORECASE).strip()
+                
+                extracted_content = {"full_text": clean_text(text_for_extraction)}
+        
+        if not extracted_content and text_for_extraction:
+            extracted_content = {"full_text": clean_text(text_for_extraction)}
+        
+        section_doc = {
+            "page_number": page_num,
+            "section_type": section_type,
+            "section_title": section_title,
+            **extracted_content
+        }
+        
+        restructured_doc["content_sections"].append(section_doc)
+        
+    return restructured_doc
+
+def process_pdf_with_document_intelligence(pdf_file_path: str) -> AnalyzeResult:
+    doc_intelligence_client = get_doc_intelligence_client()
+    if not doc_intelligence_client:
+        raise ConnectionError("DocumentIntelligence client not initialized.")
+    logger.info(f"Analyzing document: {pdf_file_path} with Azure Document Intelligence...")
+    with open(pdf_file_path, "rb") as pdf_file:
+        pdf_bytes = pdf_file.read()
+        poller = doc_intelligence_client.begin_analyze_document("prebuilt-layout", body=pdf_bytes)
+        result = poller.result()
+    logger.info("Document analysis complete.")
+    return result
+
+def main():
+    try:
+        Config.get_required_config("DOCUMENT_INTELLIGENCE_ENDPOINT")
+        Config.get_required_config("DOCUMENT_INTELLIGENCE_KEY")
+    except EnvironmentError as e:
+        logger.error(e)
+        return
+
+    sample_pdf_path = "NOYA.pdf"
+    if not os.path.exists(sample_pdf_path):
+        logger.error(f"Error: PDF file not found at '{sample_pdf_path}'")
+        logger.error("Please place a PDF file in the same directory or update 'sample_pdf_path'.")
+        return
+
+    try:
+        doc_intelligence_output = process_pdf_with_document_intelligence(sample_pdf_path)
+        file_name_from_path = os.path.basename(sample_pdf_path)
+        
+        restructured_data = restructure_document_to_desired_format(doc_intelligence_output, file_name_from_path)
+        
+        base_name, _ = os.path.splitext(file_name_from_path)
+        json_file_path = f"{base_name}_restructured.json"
+        
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(restructured_data, f, indent=4, ensure_ascii=False)
+        logger.info(f"Successfully wrote restructured document to {json_file_path}.")
+    except Exception as e:
+        logger.error(f"An error occurred during PDF processing: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()
